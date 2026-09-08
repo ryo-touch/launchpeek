@@ -1,4 +1,6 @@
 node_modules/
 launchpeek
+# bun build --compile が残す中間バイナリ (1 個 60MB 超)
+.*.bun-build
 *.log
 .DS_Store
