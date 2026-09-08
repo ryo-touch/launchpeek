@@ -22,6 +22,7 @@ macOS の launchd ジョブ（LaunchAgents）を、Sidekiq の管理画面のよ
 * macOS 13 以降
 * Bun がインストール済み
 * 開発中は user ドメイン（`gui/<uid>`）のみを扱う。sudo や特権ヘルパーは不要
+* ユーザー設定は `~/.config/launchpeek/config.json`（任意。無くても動く）
 
 ## 技術スタック
 
@@ -65,6 +66,7 @@ launchpeek/
       schedule.ts        StartInterval / StartCalendarInterval から nextRun を計算
       actions.ts         kickstart 等のアクション
       logs.ts            ログファイルの tail
+      config.ts          ユーザー設定 (label ごとの追加ログパス)
       watcher.ts         LaunchAgents ディレクトリ監視
     ui/
       Header.tsx
@@ -154,6 +156,35 @@ export interface ActionResult {
   ok: boolean;
   message: string;
 }
+
+export type LogKind = "out" | "err" | "extra";
+
+// logs 画面のヘッダーと本文を同じ情報から描くための参照元
+export interface LogSource {
+  kind: LogKind;
+  tag: string; // "out" / "err" / "log1".."logN"
+  path: string;
+}
+
+export interface LogFileTail extends LogSource {
+  lines: string[];
+  size: number;
+  ino: number;
+  mtimeMs: number;
+  error?: string;
+}
+
+// 端末の行数に収まるよう割り当て済みの 1 ソース分
+export interface LogBlock extends LogSource {
+  error?: string;
+  lines: string[];
+  hiddenCount: number;
+}
+
+export interface LogLayout {
+  blocks: LogBlock[];
+  hiddenSources: number;
+}
 ```
 
 category の判定規則
@@ -236,10 +267,52 @@ uid の取得
 
 `core/logs.ts`
 
-* stdoutPath と stderrPath を対象にする。両方ある場合は行頭に `[out]` `[err]` を付けて時系列順に混ぜず、ファイルごとに末尾 N 行を読んで連結する
-* N は 200 とし、state にはこの分だけ保持する
-* logs モードの間は 1 秒ごとにファイルサイズを確認し、増えていれば差分を読む
-* ファイルが存在しない、または読めない場合はその旨を表示する
+対象ファイル
+
+* stdoutPath、stderrPath、および設定ファイル (`core/config.ts`) で label に紐付けた追加ログを対象にする
+* 順序は stdout → stderr → 追加ログ (設定順)。tag はそれぞれ `out` / `err` / `log1`..`logN`
+* 同じパスは 1 回だけ表示する。判定はパス文字列の完全一致で行い、realpath の解決はしない (symlink 経由で同一ファイルを指す別パスは別ソースとして出る)
+* `/dev/null` も特別扱いせずソースとして扱う (stdout が捨てられていることが画面から分かる)
+
+読み取り
+
+* N は 200 とし、state にはこの分だけ保持する。末尾から読むのは最大 256KiB
+* logs モードの間は 1 秒ごとに `stat` を 1 回だけ実行し、次の順で判定する。順序には意味があるので入れ替えない
+  1. `stat` 失敗: error 状態にする
+  2. 直前が error: 末尾から読み直す (消えた後に inode が再利用されたケースを先に救う)
+  3. inode が変わった: 読み直す (rename + 再作成、symlink の張り替え)
+  4. サイズが縮んだ: 読み直す (truncate、ローテーション)
+  5. サイズが同じで mtime が変わった: 読み直す (同サイズでの書き換え)
+  6. サイズも mtime も同じ: 変化なし
+  7. サイズが増えた: 前回位置からの差分だけを読む
+* ファイルが存在しない、または読めない場合は、対象パスと理由をそのソースのヘッダーに表示する
+
+表示
+
+* 時系列順には混ぜない。ソースごとにブロックへ分け、行頭に `[out]` `[err]` `[log1]` のような tag を付ける
+* 1 ソースにつきヘッダー 1 行 (tag とパス、隠れた行数) + 本文を使う
+* 端末の行数はソース間で配分する。行数の少ないソースから順に配ることで、古い行が大量に残ったソースが小さいソースを画面外へ押し出さないようにする
+* 行数がソース数にも足りない場合は、表示できなかったソース数を注記する
+
+## 設定ファイル仕様
+
+`core/config.ts`
+
+* 場所は `~/.config/launchpeek/config.json` 固定。環境変数での上書きはしない (テストは `loadConfig(path)` の引数で差し替える)
+* 形式は JSON。依存を増やさないため `JSON.parse` で読む
+
+```json
+{
+  "extraLogPaths": {
+    "<launchd の Label 完全一致>": ["~/Library/Logs/example/run.log"]
+  }
+}
+```
+
+* パスは絶対パス、または先頭の `~` / `~/` のみ展開する。相対パスと `$VAR` は受け付けない (シェル評価はしない)
+* ファイルが無いのは正常な状態として扱い、警告しない
+* 壊れている場合も落とさない。トップレベルが object でない・JSON が壊れている場合は設定全体を捨て、それ以外 (値が配列でない、要素が文字列でない、空文字列、解決できないパス) は**その label だけを落として他の label は生かす**
+* 警告には原因を特定できるよう label とパスを含め、logs 画面の上部と StatusBar の警告件数に出す
 
 ## UI 仕様
 
@@ -255,11 +328,12 @@ list
 detail
 
 * 左に JobList を縮小表示、右に JobDetail
-* JobDetail は label、plistPath、program と arguments、schedule、keepAlive / runAtLoad、stdout / stderr パス、pid、state、lastExitCode、runCount、nextRun を表示
+* JobDetail は label、plistPath、program と arguments、schedule、keepAlive / runAtLoad、stdout / stderr パス、追加ログパス、pid、state、lastExitCode、runCount、nextRun を表示
 
 logs
 
-* 全画面で LogTail。上部 1 行に label とファイルパス
+* 全画面で LogTail。上部 1 行に label、続けて設定の警告があればその行 (最大 3 行)
+* 以降はソースごとに、ヘッダー 1 行 (tag とパス) + 割り当てられた本文行
 
 ### キーバインド
 
@@ -298,13 +372,17 @@ export interface AppState {
   filterEditing: boolean;
   message?: string;
   pendingConfirm?: { kind: ActionKind; job: Job };
-  logLines: string[];
+  // 画面への行数配分は端末の高さが要るので描画時に行う。ここは読んだ生の tail を持つ
+  logTails: LogFileTail[];
+  config: UserConfig;
+  configWarnings: string[];
   lastUpdated?: Date;
   loading: boolean;
 }
 ```
 
 * 一覧の再取得は 3 秒間隔のポーリング。`watcher.ts` が plist の変更を検知した場合は即時再取得する
+* 設定ファイルも一覧と同じ間隔で読み直す (編集はホットリロードされる)
 * 再取得中も UI は操作できる。前回の jobs を表示したまま差し替える
 * 選択中の label は再取得後も維持する（index ではなく label で追従する）
 
