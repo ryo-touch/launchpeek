@@ -1,4 +1,5 @@
-import type { ActionKind, Job } from "./types";
+import { emptyConfig, type UserConfig } from "./core/config";
+import type { ActionKind, Job, LogFileTail } from "./types";
 
 export type Mode = "list" | "detail" | "logs";
 
@@ -11,7 +12,10 @@ export interface AppState {
   filterEditing: boolean;
   message?: string;
   pendingConfirm?: { kind: ActionKind; job: Job };
-  logLines: string[];
+  // 画面への行数配分は端末の高さが必要なため描画時に行う。ここは読んだ生の tail を持つ
+  logTails: LogFileTail[];
+  config: UserConfig;
+  configWarnings: string[];
   lastUpdated?: Date;
   loading: boolean;
   // logs モードは list と detail の両方から入れるため、戻り先を覚えておく
@@ -25,7 +29,9 @@ export const initialState: AppState = {
   mode: "list",
   filter: "",
   filterEditing: false,
-  logLines: [],
+  logTails: [],
+  config: emptyConfig(),
+  configWarnings: [],
   loading: true,
   logsReturnMode: "list",
 };
@@ -38,7 +44,8 @@ export type Action =
   | { type: "set-mode"; mode: Mode }
   | { type: "open-logs" }
   | { type: "close-logs" }
-  | { type: "log-lines"; lines: string[] }
+  | { type: "log-tails"; tails: LogFileTail[] }
+  | { type: "config-updated"; config: UserConfig; warnings: string[] }
   | { type: "set-message"; message: string }
   | { type: "clear-message" }
   | { type: "confirm-request"; kind: ActionKind; job: Job }
@@ -113,12 +120,18 @@ export function reducer(state: AppState, action: Action): AppState {
         ...state,
         mode: "logs",
         logsReturnMode: state.mode,
-        logLines: [],
+        logTails: [],
       };
     case "close-logs":
-      return { ...state, mode: state.logsReturnMode, logLines: [] };
-    case "log-lines":
-      return { ...state, logLines: action.lines };
+      return { ...state, mode: state.logsReturnMode, logTails: [] };
+    case "log-tails":
+      return { ...state, logTails: action.tails };
+    case "config-updated":
+      return {
+        ...state,
+        config: action.config,
+        configWarnings: action.warnings,
+      };
     case "set-message":
       return { ...state, message: action.message };
     case "clear-message":

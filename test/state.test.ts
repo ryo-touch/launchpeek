@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { initialState, reducer, selectedJob, visibleJobs } from "../src/state";
-import type { Job } from "../src/types";
+import type { Job, LogFileTail } from "../src/types";
 
 function job(label: string): Job {
   return {
@@ -48,6 +48,42 @@ describe("filter", () => {
     s = reducer(s, { type: "filter-clear" });
     expect(selectedJob(s)?.label).toBe("org.other.gamma");
     expect(s.selectedIndex).toBe(2);
+  });
+});
+
+describe("logs モードと設定", () => {
+  const tail: LogFileTail = {
+    kind: "extra",
+    tag: "log1",
+    path: "/tmp/x.log",
+    lines: ["hello"],
+    size: 6,
+    ino: 1,
+    mtimeMs: 1,
+  };
+
+  test("logs を開閉すると tail を捨てて戻り先へ戻る", () => {
+    let s = reducer(loaded, { type: "set-mode", mode: "detail" });
+    s = reducer(s, { type: "open-logs" });
+    expect(s.mode).toBe("logs");
+    expect(s.logsReturnMode).toBe("detail");
+    s = reducer(s, { type: "log-tails", tails: [tail] });
+    expect(s.logTails).toEqual([tail]);
+    s = reducer(s, { type: "close-logs" });
+    expect(s.mode).toBe("detail");
+    expect(s.logTails).toEqual([]);
+  });
+
+  test("config-updated が設定と警告を差し替える", () => {
+    const s = reducer(loaded, {
+      type: "config-updated",
+      config: { extraLogPaths: { "com.example.alpha": ["/tmp/x.log"] } },
+      warnings: ["壊れています"],
+    });
+    expect(s.config.extraLogPaths["com.example.alpha"]).toEqual(["/tmp/x.log"]);
+    expect(s.configWarnings).toEqual(["壊れています"]);
+    // 設定の警告は jobs 側の warnings を上書きしない
+    expect(s.warnings).toEqual([]);
   });
 });
 

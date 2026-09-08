@@ -9,18 +9,18 @@ import {
   type ListEntry,
   type PrintInfo,
 } from "./core/launchctl";
+import { extraLogPathsFor, loadConfig } from "./core/config";
 import {
-  formatLogLines,
+  layoutLogBlocks,
   logSourcesOf,
   refreshTail,
   tailFile,
-  type LogFileTail,
 } from "./core/logs";
 import { emptySources, mergeJobs } from "./core/merge";
 import { loadDefinitions } from "./core/plist";
 import { watchAgentDirs } from "./core/watcher";
 import { initialState, reducer, selectedJob, visibleJobs } from "./state";
-import type { ActionKind, Job } from "./types";
+import type { ActionKind, Job, LogFileTail } from "./types";
 import { FilterInput } from "./ui/FilterInput";
 import { Header } from "./ui/Header";
 import { JobDetail } from "./ui/JobDetail";
@@ -29,6 +29,9 @@ import { LogTail } from "./ui/LogTail";
 import { StatusBar } from "./ui/StatusBar";
 
 const uid = process.getuid?.() ?? 0;
+
+// 設定の警告は原因が分かれば十分なので、logs 画面を潰さない範囲で出す
+const MAX_CONFIG_WARNING_ROWS = 3;
 
 // bootout / kill は取り消しが利かないので実行前に y の確認を挟む (SPEC)
 const CONFIRM_ACTIONS: ReadonlySet<ActionKind> = new Set(["bootout", "kill"]);
@@ -56,6 +59,9 @@ export function App() {
       // 遅い launchctl print の詳細は後から埋めて再描画する
       const warnings: string[] = [];
       const sources = emptySources();
+      // 設定は一覧と同じ間隔で読み直すので、編集はホットリロードされる。
+      // 初回描画を遅らせないよう plist / launchctl の読み取りと並行させる (SPEC 非機能要件)
+      const configPromise = loadConfig();
       let definitions: Awaited<
         ReturnType<typeof loadDefinitions>
       >["definitions"] = [];
@@ -73,6 +79,13 @@ export function App() {
       } catch (err) {
         warnings.push(String(err));
       }
+      // loadConfig は内部で catch 済みなので、上の失敗有無に関わらず必ず反映できる
+      const configResult = await configPromise;
+      dispatch({
+        type: "config-updated",
+        config: configResult.config,
+        warnings: configResult.warnings,
+      });
       dispatch({
         type: "jobs-updated",
         jobs: mergeJobs(definitions, sources, new Date()),
@@ -147,6 +160,15 @@ export function App() {
   const jobsRef = useRef(state.jobs);
   jobsRef.current = state.jobs;
   const selectedLabel = selectedJob(state)?.label;
+  const selectedExtraPaths =
+    selectedLabel === undefined
+      ? []
+      : extraLogPathsFor(state.config, selectedLabel);
+  const extraPathsRef = useRef(selectedExtraPaths);
+  extraPathsRef.current = selectedExtraPaths;
+  // 表示中に設定を直したときも拾えるよう effect の依存に含める。
+  // 区切りには POSIX パスに現れない NUL を使う
+  const extraPathsKey = selectedExtraPaths.join("\u0000");
 
   useEffect(() => {
     if (state.mode !== "logs") return;
@@ -158,12 +180,12 @@ export function App() {
     let tails: LogFileTail[] = [];
 
     const publish = () => {
-      if (!stopped) dispatch({ type: "log-lines", lines: formatLogLines(tails) });
+      if (!stopped) dispatch({ type: "log-tails", tails });
     };
 
     (async () => {
       tails = await Promise.all(
-        logSourcesOf(job).map((s) => tailFile(s.kind, s.path)),
+        logSourcesOf(job, extraPathsRef.current).map((s) => tailFile(s)),
       );
       publish();
     })();
@@ -185,7 +207,7 @@ export function App() {
       stopped = true;
       clearInterval(timer);
     };
-  }, [state.mode, selectedLabel]);
+  }, [state.mode, selectedLabel, extraPathsKey]);
 
   // 高速連打やペーストでは複数キーが 1 チャンクで届くため、1 文字ずつ処理する
   useInput((chunk, key) => {
@@ -303,17 +325,33 @@ export function App() {
       mode={state.mode}
       message={state.message}
       confirmPrompt={confirmPrompt}
-      warnings={state.warnings}
+      warnings={[...state.warnings, ...state.configWarnings]}
     />
   );
 
   if (state.mode === "logs") {
-    // 全画面で LogTail。上部 1 行に label とファイルパス (SPEC)
+    // 全画面で LogTail。上部 1 行に label、ソースごとにヘッダー 1 行 + 本文 (SPEC)。
+    // 行数配分は端末の高さが要るので描画時に決める。警告行のクランプもここ 1 箇所で行い、
+    // LogTail 側では再クランプしないことで行数計算がずれないようにする
+    // 端末が低いときは警告行がログを潰さないよう、本文に 1 行は残す
+    const configWarnings = state.configWarnings.slice(
+      0,
+      Math.max(0, Math.min(MAX_CONFIG_WARNING_ROWS, height - 3)),
+    );
+    const layout = layoutLogBlocks(
+      state.logTails,
+      height - 1 - 1 - configWarnings.length,
+    );
+    const logsJob = selectedJob(state);
     return (
       <Box flexDirection="column" width={width}>
         <LogTail
-          job={selectedJob(state)}
-          lines={state.logLines}
+          label={selectedLabel}
+          layout={layout}
+          configWarnings={configWarnings}
+          sourceCount={
+            logsJob ? logSourcesOf(logsJob, selectedExtraPaths).length : 0
+          }
           height={height - 1}
         />
         {statusLine}
@@ -341,7 +379,11 @@ export function App() {
               compact
             />
           </Box>
-          <JobDetail job={selectedJob(state)} height={listHeight} />
+          <JobDetail
+            job={selectedJob(state)}
+            extraLogPaths={selectedExtraPaths}
+            height={listHeight}
+          />
         </Box>
       ) : (
         <JobList

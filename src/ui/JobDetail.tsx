@@ -4,6 +4,8 @@ import { formatTime, summarizeSchedule } from "../util/format";
 
 interface Props {
   job?: Job;
+  // 設定ファイルで label に紐付けた追加ログ (解決済みの絶対パス)
+  extraLogPaths?: readonly string[];
   height: number;
 }
 
@@ -18,7 +20,7 @@ function Row({ name, value }: { name: string; value: string }) {
   );
 }
 
-export function JobDetail({ job, height }: Props) {
+export function JobDetail({ job, extraLogPaths = [], height }: Props) {
   if (!job) {
     return (
       <Box height={height} paddingLeft={1}>
@@ -51,6 +53,10 @@ export function JobDetail({ job, height }: Props) {
       />
       <Row name="stdout" value={job.stdoutPath ?? "-"} />
       <Row name="stderr" value={job.stderrPath ?? "-"} />
+      <Row
+        name="extra logs"
+        value={extraLogPaths.length > 0 ? extraLogPaths.join("  ") : "-"}
+      />
       <Row name="pid" value={rt.pid?.toString() ?? "-"} />
       <Row
         name="state"
